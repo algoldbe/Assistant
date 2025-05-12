@@ -12,6 +12,8 @@ import keyboard
 import pyperclip
 import pyaudio
 import tkinter as tk
+import tkinter.font as tkFont
+from tkinter import ttk
 from PIL import Image, ImageDraw
 import pystray
 from pynput.keyboard import Controller, Key
@@ -55,9 +57,10 @@ TTS_RESPONSE_FORMAT = "wav"
 # Define hotkeys
 DICTATION_HOTKEY = 'f9'  # Hold to dictate
 ASSISTANT_HOTKEY = 'f12'  # Hold for assistant (Prompt)
-PARAPHRASE_HOTKEY = 'ctrl+alt+p'  # Paraphrase selected text
+PARAPHRASE_HOTKEY = 'f8'  # Paraphrase selected text
 LANGUAGE_TOGGLE_HOTKEY = 'ctrl+alt+l'  # Toggle between English and Spanish
 TEXT_TO_SPEECH_HOTKEY = 'ctrl+alt+s'  # New hotkey for TTS
+TEXT_PROMPT_HOTKEY = 'f10'  # New hotkey for text prompt entry
 
 # Audio recording settings
 FORMAT = pyaudio.paInt16
@@ -73,8 +76,8 @@ PARAPHRASING_STYLES = [
     {
         "name": "Standard",
         #"system_prompt": "You are a helpful assistant that paraphrases and improves text. Correct any grammar or structure issues. Keep the same language as the original text. Your response should ONLY contain the paraphrased text without any explanations, notes, or formatting.",
-        "system_prompt": "You are a precise grammar and formatting assistant. Your only task is to correct grammar, punctuation, spelling, and formatting issues while preserving the original wording as much as possible. Make minimal changes - only fix errors without rewriting or paraphrasing. Keep the same language as the original text. Your response should ONLY contain the corrected text without any explanations or notes.",
-        "temperature": 0.1
+        "system_prompt": "You are a skilled editor who improves text quality while maintaining the author's voice. Your tasks are to: 1) Fix grammar, punctuation, and spelling errors, 2) Enhance clarity by improving awkward phrasing, 3) Suggest better word choices where appropriate, and 4) Reorganize sentences for better flow when needed. Make moderate changes that preserve the original meaning but improve its expression. Keep the same language as the original text. Your response should ONLY contain the improved text without any explanations or notes.",
+        "temperature": 0.3
     },
     {
         "name": "More Creative",
@@ -93,6 +96,428 @@ PARAPHRASING_STYLES = [
     }
 ]
 
+class PromptEntryBox:
+    def __init__(self, parent, callback, exit_callback):
+        """Initialize the prompt entry box
+        
+        Args:
+            parent: The parent tkinter window
+            callback: Function to call with the entered prompt
+            exit_callback: Function to call when canceling
+        """
+        self.parent = parent
+        self.callback = callback
+        self.exit_callback = exit_callback
+        self.window = None
+        
+        # Load settings from config file
+        self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompt_box_config.json')
+        self.load_config()
+        
+        # Resize state
+        self.resizing = False
+        self.resize_edge = None
+        self.resize_start_x = 0
+        self.resize_start_y = 0
+        self.resize_start_width = 0
+        self.resize_start_height = 0
+        
+        # Minimum size constraints
+        self.min_width = 300
+        self.min_height = 150
+    
+    def load_config(self):
+        """Load configuration from file"""
+        # Default values
+        self.last_width = 500
+        self.last_height = 180
+        self.last_x = -1  # -1 means center
+        self.last_y = -1  # -1 means default position
+        
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                    self.last_width = config.get('width', 500)
+                    self.last_height = config.get('height', 180)
+                    self.last_x = config.get('x', -1)
+                    self.last_y = config.get('y', -1)
+                    print(f"Loaded config: {self.last_width}x{self.last_height} at ({self.last_x},{self.last_y})")
+            else:
+                print(f"Config file not found, using defaults")
+        except Exception as e:
+            print(f"Error loading config: {e}")
+        
+    def save_config(self):
+        """Save configuration to file"""
+        try:
+            config = {
+                'width': self.last_width,
+                'height': self.last_height,
+                'x': self.last_x,
+                'y': self.last_y
+            }
+            
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f)
+                print(f"Saved config: {self.last_width}x{self.last_height} at ({self.last_x},{self.last_y})")
+        except Exception as e:
+            print(f"Error saving config: {e}")
+        
+    def create_resize_bindings(self):
+        """Create all resize handle bindings"""
+        # Resize handle bindings
+        self.canvas.tag_bind("resize_br", "<ButtonPress-1>", lambda e: self.start_resize(e, "br"))
+        self.canvas.tag_bind("resize_r", "<ButtonPress-1>", lambda e: self.start_resize(e, "r"))
+        self.canvas.tag_bind("resize_b", "<ButtonPress-1>", lambda e: self.start_resize(e, "b"))
+        
+        # Mouse cursor change on hover over resize handles
+        self.canvas.tag_bind("resize_br", "<Enter>", lambda e: self.window.config(cursor="sizing"))
+        self.canvas.tag_bind("resize_br", "<Leave>", lambda e: self.window.config(cursor=""))
+        self.canvas.tag_bind("resize_r", "<Enter>", lambda e: self.window.config(cursor="size_we"))
+        self.canvas.tag_bind("resize_r", "<Leave>", lambda e: self.window.config(cursor=""))
+        self.canvas.tag_bind("resize_b", "<Enter>", lambda e: self.window.config(cursor="size_ns"))
+        self.canvas.tag_bind("resize_b", "<Leave>", lambda e: self.window.config(cursor=""))
+        
+    def show(self, x=None, y=None):
+        """Show the prompt entry box at the specified location
+        
+        Args:
+            x: X position (if None, uses saved position or centers)
+            y: Y position (if None, uses saved position or default)
+        """
+        # If already showing, bring to front and return
+        if self.window and self.window.winfo_exists():
+            self.window.lift()
+            self.window.focus_force()
+            self.text_entry.focus_set()
+            return
+            
+        # Create a new Toplevel window
+        self.window = tk.Toplevel(self.parent)
+        self.window.title("Assistant Prompt")
+        
+        # Remove window decorations for a cleaner look
+        self.window.overrideredirect(True)
+        
+        # Set window properties
+        self.window.attributes('-topmost', True)
+        
+        # Use saved size
+        width = self.last_width
+        height = self.last_height
+        
+        # If explicit position is given, use it
+        use_x = x
+        use_y = y
+        
+        # If no explicit position and we have a saved position, use saved
+        if use_x is None and self.last_x >= 0:
+            use_x = self.last_x
+            print(f"Using saved X position: {use_x}")
+        
+        if use_y is None and self.last_y >= 0:
+            use_y = self.last_y
+            print(f"Using saved Y position: {use_y}")
+        
+        # If still no position, calculate default position
+        if use_x is None:
+            screen_width = self.window.winfo_screenwidth()
+            use_x = (screen_width - width) // 2
+            print(f"Using calculated X position: {use_x}")
+        
+        if use_y is None:
+            screen_height = self.window.winfo_screenheight()
+            use_y = screen_height - height - 100  # 100px from bottom
+            print(f"Using calculated Y position: {use_y}")
+        
+        print(f"Setting window geometry to: {width}x{height}+{use_x}+{use_y}")
+        self.window.geometry(f"{width}x{height}+{use_x}+{use_y}")
+        
+        # Set dark theme colors
+        bg_color = "#2E2E2E"
+        fg_color = "#FFFFFF"
+        accent_color = "#4287f5"
+        button_bg = "#3D3D3D"
+        
+        self.window.configure(bg=bg_color)
+        
+        # Create rounded frame with shadow effect using Canvas
+        self.canvas = tk.Canvas(self.window, bg=bg_color, highlightthickness=0)
+        self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        
+        # Create a shadow effect with fixed colors instead of alpha transparency
+        shadow_colors = ["#333333", "#3A3A3A", "#414141", "#484848", "#505050"]
+        
+        # Create an update_canvas method to update the interface elements when window resizes
+        def update_canvas(event=None):
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
+            
+            # Clear the canvas
+            self.canvas.delete("all")
+            
+            # Redraw shadows
+            for i in range(5):
+                self.canvas.create_rectangle(
+                    10-i, 10-i, canvas_width-10+i, canvas_height-10+i,
+                    outline=shadow_colors[i], width=1
+                )
+            
+            # Redraw main rectangle
+            self.canvas.create_rectangle(
+                10, 10, canvas_width-10, canvas_height-10,
+                fill=bg_color, outline=accent_color, width=2, tags="main_rect"
+            )
+            
+            # Create resize handles in corners and sides
+            # Bottom right corner (diagonal resize)
+            self.canvas.create_rectangle(
+                canvas_width-20, canvas_height-20, canvas_width-10, canvas_height-10,
+                fill=accent_color, outline=accent_color, tags="resize_br"
+            )
+            
+            # Right edge (horizontal resize)
+            self.canvas.create_rectangle(
+                canvas_width-15, canvas_height//2-15, canvas_width-10, canvas_height//2+15,
+                fill=accent_color, outline=accent_color, tags="resize_r"
+            )
+            
+            # Bottom edge (vertical resize)
+            self.canvas.create_rectangle(
+                canvas_width//2-15, canvas_height-15, canvas_width//2+15, canvas_height-10,
+                fill=accent_color, outline=accent_color, tags="resize_b"
+            )
+            
+            # Set up resize bindings for the newly created handles
+            self.create_resize_bindings()
+        
+        # Bind to configure event to update canvas when window size changes
+        self.canvas.bind("<Configure>", update_canvas)
+        
+        # Create a frame for content
+        content_frame = tk.Frame(self.window, bg=bg_color)
+        content_frame.place(x=20, y=20, relwidth=1, relheight=1, width=-40, height=-40)
+        
+        # Create title label
+        title_font = tkFont.Font(family="Arial", size=12, weight="bold")
+        title_label = tk.Label(
+            content_frame, 
+            text="Please enter your prompt", 
+            font=title_font, 
+            bg=bg_color, 
+            fg=fg_color
+        )
+        title_label.pack(pady=(0, 10))
+        
+        # Create text entry with custom styling
+        self.text_entry = tk.Text(
+            content_frame,
+            font=("Arial", 12),
+            bg="#3D3D3D",
+            fg=fg_color,
+            insertbackground=fg_color,  # Cursor color
+            relief=tk.FLAT,
+            padx=8,
+            pady=8
+        )
+        self.text_entry.pack(pady=5, fill=tk.BOTH, expand=True)
+        self.text_entry.focus_set()
+        
+        # Create buttons frame
+        button_frame = tk.Frame(content_frame, bg=bg_color)
+        button_frame.pack(pady=10, fill=tk.X)
+        
+        # Style for buttons
+        button_style = {
+            "font": ("Arial", 9),
+            "borderwidth": 0,
+            "highlightthickness": 0,
+            "padx": 15,
+            "pady": 6,
+            "relief": tk.FLAT
+        }
+        
+        # Create buttons
+        submit_button = tk.Button(
+            button_frame,
+            text="Submit",
+            bg=accent_color,
+            fg=fg_color,
+            command=self.submit,
+            activebackground="#3b78de",
+            activeforeground=fg_color,
+            **button_style
+        )
+        
+        cancel_button = tk.Button(
+            button_frame,
+            text="Cancel",
+            bg=button_bg,
+            fg=fg_color,
+            command=self.close,
+            activebackground="#4D4D4D",
+            activeforeground=fg_color,
+            **button_style
+        )
+        
+        # Pack buttons
+        cancel_button.pack(side=tk.RIGHT, padx=5)
+        submit_button.pack(side=tk.RIGHT, padx=5)
+        
+        # Add key bindings
+        self.window.bind("<Return>", lambda event: self.submit())
+        self.window.bind("<Escape>", lambda event: self.close())
+        
+        # Handle window close
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        
+        # Add drag functionality for moving the window
+        self.canvas.bind("<ButtonPress-1>", self.start_move)
+        self.canvas.bind("<ButtonRelease-1>", self.stop_move)
+        self.canvas.bind("<B1-Motion>", self.do_move)
+        
+        # Add resize event handlers
+        self.window.bind("<ButtonRelease-1>", self.stop_resize)
+        self.window.bind("<B1-Motion>", self.do_resize)
+        
+        # Initialize drag variables
+        self.x = 0
+        self.y = 0
+        
+        # Initial draw
+        self.window.update_idletasks()
+        update_canvas()
+        
+    def update_geometry(self):
+        """Update stored geometry info from current window"""
+        if self.window and self.window.winfo_exists():
+            self.last_width = self.window.winfo_width()
+            self.last_height = self.window.winfo_height()
+            self.last_x = self.window.winfo_x()
+            self.last_y = self.window.winfo_y()
+            
+            print(f"Updated geometry: {self.last_width}x{self.last_height} at ({self.last_x},{self.last_y})")
+        
+    def start_move(self, event):
+        """Start window drag operation"""
+        # Only start move if not on resize handle
+        item = self.canvas.find_withtag("current")
+        if item and any(tag in self.canvas.gettags(item) for tag in ["resize_br", "resize_r", "resize_b"]):
+            return
+            
+        self.x = event.x
+        self.y = event.y
+        
+    def stop_move(self, event):
+        """Stop window drag operation"""
+        if self.x is not None:
+            # Update and save position
+            self.update_geometry()
+            self.save_config()
+            
+        self.x = None
+        self.y = None
+        
+    def do_move(self, event):
+        """Move window during drag operation"""
+        if self.window and self.x is not None and self.y is not None:
+            deltax = event.x - self.x
+            deltay = event.y - self.y
+            x = self.window.winfo_x() + deltax
+            y = self.window.winfo_y() + deltay
+            self.window.geometry(f"+{x}+{y}")
+    
+    def start_resize(self, event, edge):
+        """Start resize operation
+        
+        Args:
+            event: The mouse event
+            edge: Which edge/corner is being resized ('br' = bottom-right, 'r' = right, 'b' = bottom)
+        """
+        self.resizing = True
+        self.resize_edge = edge
+        self.resize_start_x = event.x_root
+        self.resize_start_y = event.y_root
+        self.resize_start_width = self.window.winfo_width()
+        self.resize_start_height = self.window.winfo_height()
+        
+    def stop_resize(self, event):
+        """Stop resize operation"""
+        if self.resizing:
+            # Update and save size
+            self.update_geometry()
+            self.save_config()
+            
+        self.resizing = False
+        self.resize_edge = None
+        
+    def do_resize(self, event):
+        """Handle resizing of the window"""
+        if not self.resizing or not self.window:
+            return
+            
+        # Calculate deltas
+        delta_x = event.x_root - self.resize_start_x
+        delta_y = event.y_root - self.resize_start_y
+        
+        # Calculate new dimensions based on which edge is being dragged
+        new_width = self.resize_start_width
+        new_height = self.resize_start_height
+        
+        if self.resize_edge in ["br", "r"]:  # Right edge or bottom-right corner
+            new_width = max(self.min_width, self.resize_start_width + delta_x)
+            
+        if self.resize_edge in ["br", "b"]:  # Bottom edge or bottom-right corner
+            new_height = max(self.min_height, self.resize_start_height + delta_y)
+        
+        # Apply new size
+        self.window.geometry(f"{new_width}x{new_height}")
+    
+    def submit(self):
+        """Process and submit the text prompt"""
+        if self.window:
+            prompt = self.text_entry.get("1.0", tk.END).strip()
+            if prompt:
+                # Save position and size before closing
+                self.update_geometry()
+                self.save_config()
+                
+                # Close window and return prompt
+                self.window.destroy()
+                self.window = None
+                self.callback(prompt)
+            else:
+                # Shake the window gently to indicate empty input
+                self.shake_window()
+    
+    def shake_window(self):
+        """Shake the window to indicate error"""
+        if not self.window:
+            return
+            
+        original_x = self.window.winfo_x()
+        
+        def _shake(count, distance, speed):
+            if count > 0 and self.window:
+                self.window.geometry(f"+{original_x + distance}+{self.window.winfo_y()}")
+                self.window.after(speed, lambda: _shake(count-1, -distance, speed))
+                
+        _shake(10, 10, 50)
+    
+    def close(self):
+        """Close the prompt entry box"""
+        if self.window:
+            # Save position and size before closing
+            self.update_geometry()
+            self.save_config()
+            
+            # Then close
+            self.window.destroy()
+            self.window = None
+            if self.exit_callback:
+                self.exit_callback()
+                
 class UnifiedAssistant:
     # Message display timeout settings (in milliseconds)
     MESSAGE_TIMEOUTS = {
@@ -121,7 +546,7 @@ class UnifiedAssistant:
         self.target_window = None
         
         # State tracking
-        self.mode = "idle"  # idle, dictation, assistant, paraphrase
+        self.mode = "idle"  # idle, dictation, assistant, paraphrase, text_prompt
         self.paraphrase_style_index = 0
         self.current_language = os.getenv('DEFAULT_LANGUAGE', 'english').lower()
         if self.current_language not in ["english", "spanish"]:
@@ -156,7 +581,23 @@ class UnifiedAssistant:
         self.root.withdraw()
         self.setup_overlay_windows()
         
-        # Create tray icon
+        # Create text prompt entry box
+        self.prompt_entry = None  # Will be initialized when needed
+        
+        # Load prompt box preferences
+        self.prompt_box_width = int(os.getenv("PROMPT_BOX_WIDTH", "500"))
+        self.prompt_box_height = int(os.getenv("PROMPT_BOX_HEIGHT", "180"))
+        self.prompt_box_x = int(os.getenv("PROMPT_BOX_X", "-1"))
+        self.prompt_box_y = int(os.getenv("PROMPT_BOX_Y", "-1"))
+        
+        # Load personal information
+        self.user_info = self.load_user_info()
+        
+        # Load templates BEFORE setting up the tray icon
+        self.templates = {}
+        self.load_templates()
+        
+        # Now create tray icon
         self.setup_tray_icon()
         
         # Register hotkeys
@@ -297,7 +738,7 @@ class UnifiedAssistant:
         except Exception as e:
             print(f"Error getting monitor info: {e}")
         return monitors or [win32api.GetMonitorInfo(win32api.EnumDisplayMonitors(None, None)[0][0])]
-    
+
     def setup_overlay_windows(self):
         """Create overlay notification windows for all monitors"""
         self.overlays = []
@@ -437,10 +878,48 @@ class UnifiedAssistant:
         
         voice_menu = pystray.Menu(*voice_menu_items)
 
+        # Create input methods submenu
+        input_methods_menu = pystray.Menu(
+            pystray.MenuItem(f'Voice Input (Press {ASSISTANT_HOTKEY})', None, enabled=False),
+            pystray.MenuItem(f'Text Input (Press {TEXT_PROMPT_HOTKEY})', lambda: self.show_text_prompt_entry()),
+            pystray.MenuItem(f'Dictation (Press {DICTATION_HOTKEY})', None, enabled=False),
+            pystray.MenuItem(f'Paraphrase (Press {PARAPHRASE_HOTKEY})', None, enabled=False),
+            pystray.MenuItem(f'Text-to-Speech (Press {TEXT_TO_SPEECH_HOTKEY})', None, enabled=False)
+        )
+
+        # Create templates submenu
+        template_menu_items = []
+        for template_name in self.templates.keys():
+            display_name = template_name.replace('_', ' ').title()
+            
+            # Create a function factory that returns a function
+            def make_template_callback(template_key):
+                def callback():
+                    return self.show_template(template_key)
+                return callback
+            
+            template_menu_items.append(
+                pystray.MenuItem(
+                    display_name,
+                    make_template_callback(template_name)
+                )
+            )
+
+        if template_menu_items:
+            template_menu_items.append(pystray.MenuItem('Reload Templates', self.reload_templates))
+            template_menu = pystray.Menu(*template_menu_items)
+        else:
+            template_menu = pystray.Menu(
+                pystray.MenuItem("No templates found", lambda: None),
+                pystray.MenuItem('Load Templates', self.reload_templates)
+            )
+
         menu = pystray.Menu(
+            pystray.MenuItem('Input Methods', input_methods_menu),
+            pystray.MenuItem('Templates', template_menu),
             pystray.MenuItem('Microphone', microphone_menu),
             pystray.MenuItem('Transcription Service', transcription_menu),
-            pystray.MenuItem('TTS Voice', voice_menu),  # New menu item
+            pystray.MenuItem('TTS Voice', voice_menu),
             pystray.MenuItem('Dictation Language', pystray.Menu(
                 pystray.MenuItem('English', lambda: self.set_language("english"), 
                     checked=lambda item: self.current_language == "english"),
@@ -465,7 +944,7 @@ class UnifiedAssistant:
         
         # Run the icon in a detached way - don't block the main thread
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
-    
+        
     def set_language(self, language):
         """Change the current language"""
         self.current_language = language
@@ -528,6 +1007,9 @@ class UnifiedAssistant:
         
         # TTS
         keyboard.add_hotkey(TEXT_TO_SPEECH_HOTKEY, self.speak_selected_text)
+        
+        # New hotkey for text prompt entry
+        keyboard.add_hotkey(TEXT_PROMPT_HOTKEY, self.show_text_prompt_entry)
     
     def show_message(self, message, timeout=None, message_type=None):
         """Show a message in the overlay windows
@@ -608,7 +1090,7 @@ class UnifiedAssistant:
         """Stop the current recording"""
         if self.recording:
             self.recording = False
-    
+            
     def record_audio_continuous(self, callback_function):
         """Record audio continuously as long as the hotkey is pressed"""
         try:
@@ -745,7 +1227,6 @@ class UnifiedAssistant:
             self.show_message(f"Error: {str(e)}", message_type="error")
             return None
 
-    # UPDATED transcribe_audio_openai method with enhanced regex replacement
     def transcribe_audio_openai(self, audio_file):
         """Transcribe audio file using OpenAI Whisper API"""
         try:
@@ -781,7 +1262,7 @@ class UnifiedAssistant:
             print(f"Error during OpenAI transcription: {str(e)}")
             self.show_message(f"OpenAI Error: {str(e)}", message_type="error")
             return None
-
+            
     def apply_custom_dictionary(self, text):
         """Apply custom dictionary corrections to transcribed text"""
         words = text.split()
@@ -1031,7 +1512,61 @@ class UnifiedAssistant:
         pyperclip.copy(original_clipboard)
         
         return selected_text
-
+        
+    def show_text_prompt_entry(self, e=None):
+        """Show the text prompt entry box"""
+        # Keep track of the active window for later
+        self.target_window = win32gui.GetForegroundWindow()
+        
+        # Create prompt entry box if it doesn't exist
+        if not hasattr(self, 'prompt_entry') or self.prompt_entry is None:
+            self.prompt_entry = PromptEntryBox(
+                self.root,
+                self.process_text_prompt,
+                self.on_prompt_cancelled
+            )
+        
+        # Show the entry box without specifying position
+        # The PromptEntryBox will use saved position from its config file
+        self.prompt_entry.show()
+        
+    def process_text_prompt(self, prompt):
+        """Process text prompt from the entry box
+        
+        Args:
+            prompt (str): The text prompt entered by the user
+        """
+        # Make the target window active again
+        if self.target_window:
+            try:
+                win32gui.SetForegroundWindow(self.target_window)
+                time.sleep(0.2)
+            except:
+                pass
+        
+        # Get any selected text for context
+        selected_text = self.get_selected_text()
+        
+        # Show processing message
+        self.show_message("Processing prompt...", message_type="processing")
+        
+        # Process with LLM
+        response = self.process_with_llm(prompt, selected_text)
+        
+        # Insert the response if we got one
+        if response:
+            self.insert_text(response)
+            self.show_message("Response inserted", message_type="success")
+    
+    def on_prompt_cancelled(self):
+        """Called when prompt entry is cancelled"""
+        # Reactivate the original target window
+        if self.target_window:
+            try:
+                win32gui.SetForegroundWindow(self.target_window)
+            except:
+                pass
+    
     def speak_selected_text(self):
         """Speak the currently selected text using Groq TTS API with improved cross-monitor support"""
         if self.processing:
@@ -1091,32 +1626,195 @@ class UnifiedAssistant:
             print(f"Error checking window visibility: {e}")
             return False
     
-    def process_with_llm(self, prompt, selected_text=""):
-        """Process text with LLM via Groq API"""
+    def load_user_info(self):
+        """Load user personal information from environment variables"""
+        user_info = {
+            "name": os.getenv("USER_NAME", ""),
+            "job_title": os.getenv("USER_JOB_TITLE", ""),
+            "company": os.getenv("USER_COMPANY", ""),
+            "email": os.getenv("USER_EMAIL", ""),
+            "team": os.getenv("USER_TEAM", ""),
+            "department": os.getenv("USER_DEPARTMENT", ""),
+            "phone": os.getenv("USER_PHONE", ""),
+            # Add any other personal details you want to load
+        }
+        
+        # Check if we have at least basic info
+        if user_info["name"]:
+            print(f"Loaded personal information for: {user_info['name']}")
+        else:
+            print("No personal user information found in .env file")
+            
+        return user_info
+        
+    def load_templates(self):
+        """Load email templates from templates.json file"""
         try:
-            if selected_text:
-                messages = [
-                    {
-                        "role": "system", 
-                        "content": "You are a helpful AI assistant that processes user requests and modifies text. Be concise and only return the processed text without explanations unless specifically asked for commentary."
-                    },
-                    {
-                        "role": "user", 
-                        "content": f"User request: {prompt}\n\nSelected text: {selected_text}"
-                    }
-                ]
+            # Get absolute path to templates file
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            template_path = os.path.join(script_dir, 'templates.json')
+            
+            print(f"Looking for templates at: {template_path}")  # Debug line
+            
+            if os.path.exists(template_path):
+                with open(template_path, 'r', encoding='utf-8') as f:
+                    self.templates = json.load(f)
+                    print(f"Loaded {len(self.templates)} templates from templates.json")
+                    # Debug: print template names
+                    print(f"Template names: {list(self.templates.keys())}")
             else:
-                messages = [
-                    {
-                        "role": "system", 
-                        "content": "You are a helpful AI assistant that processes user requests and creates text. Be concise and only return the new text without explanations unless specifically asked for commentary."
-                    },
-                    {
-                        "role": "user", 
-                        "content": prompt
-                    }
+                self.templates = {}
+                print("No templates.json file found")
+                
+        except Exception as e:
+            print(f"Error loading templates: {e}")
+            self.templates = {}
+
+    def show_template(self, template_name):
+        """Copy template content to clipboard"""
+        if template_name in self.templates:
+            template_content = self.templates[template_name]
+            
+            # Copy to clipboard
+            pyperclip.copy(template_content)
+            
+            # Show success message
+            self.show_message(f"Template copied to clipboard: {template_name}", message_type="success")
+        else:
+            self.show_message(f"Template not found: {template_name}", message_type="error")
+
+    def reload_templates(self):
+        """Reload templates from file"""
+        self.load_templates()
+        self.show_message(f"Reloaded {len(self.templates)} templates", message_type="success")
+        
+        # Recreate the tray icon to update the menu
+        if hasattr(self, 'tray_icon'):
+            self.tray_icon.stop()
+        self.setup_tray_icon()
+
+    def process_with_llm(self, prompt, selected_text=""):
+        """Process text with LLM via Groq API with personal information and templates"""
+        try:
+            # Build a user context with personal information
+            user_context = ""
+            if hasattr(self, 'user_info') and self.user_info.get("name"):
+                user_context = "Personal information to use in your responses:\n"
+                for key, value in self.user_info.items():
+                    if value:  # Only include non-empty values
+                        user_context += f"- {key.replace('_', ' ').title()}: {value}\n"
+            
+            # Check if the prompt asks for a template
+            template_to_use = None
+            explicit_template_request = False
+            prompt_lower = prompt.lower()
+            
+            # First check for explicit template requests in both languages
+            for template_key in self.templates.keys():
+                # English patterns
+                english_patterns = [
+                    f"use {template_key} template",
+                    f"use my {template_key} template",
+                    f"insert {template_key} template",
+                    f"insert my {template_key} template",
+                    f"please insert my {template_key} template",
+                    f"please use my {template_key} template"
                 ]
                 
+                # Spanish patterns
+                spanish_patterns = [
+                    f"usa la plantilla {template_key}",
+                    f"usa mi plantilla {template_key}",
+                    f"inserta la plantilla {template_key}",
+                    f"inserta mi plantilla {template_key}",
+                    f"por favor inserta mi plantilla {template_key}",
+                    f"por favor usa mi plantilla {template_key}",
+                    f"utiliza la plantilla {template_key}",
+                    f"utiliza mi plantilla {template_key}"
+                ]
+                
+                # Check if any pattern matches
+                for pattern in english_patterns + spanish_patterns:
+                    if pattern in prompt_lower:
+                        template_to_use = self.templates[template_key]
+                        explicit_template_request = True
+                        break
+                
+                if template_to_use:
+                    break
+            
+            # If no explicit request, check for keywords
+            if not template_to_use:
+                keywords_to_templates = {
+                    "case closure": "case_closure",
+                    "cierre de caso": "case_closure",  # Spanish equivalent
+                    "meeting request": "meeting_request",
+                    "solicitud de reunión": "meeting_request",  # Spanish equivalent
+                    "follow up": "follow_up",
+                    "follow-up": "follow_up",
+                    "seguimiento": "follow_up"  # Spanish equivalent
+                }
+                
+                for keyword, template_key in keywords_to_templates.items():
+                    if keyword in prompt_lower and template_key in self.templates:
+                        template_to_use = self.templates[template_key]
+                        break
+            
+            # Check if signature is explicitly requested
+            signature_requested = any(term in prompt_lower for term in [
+                "with signature", "with my signature", "add signature", 
+                "include signature", "sign it", "add my signature"
+            ])
+            
+            # Add system message with personal information and templates
+            system_message = "You are a helpful AI assistant that processes user requests and modifies text. You understand and respond to requests in both English and Spanish. "
+            
+            if template_to_use:
+                if explicit_template_request:
+                    system_message += "The user has explicitly requested to use a specific template. "
+                    system_message += f"MANDATORY: Use this template exactly as the base for your response:\n\n{template_to_use}\n\n"
+                else:
+                    system_message += f"IMPORTANT: Use this template as the base for your response:\n\n{template_to_use}\n\n"
+                system_message += "Fill in the template variables with appropriate information from the user's request. "
+            
+            if user_context:
+                system_message += "Use the provided personal information when creating content like emails, reports, or other documents. "
+                
+                if signature_requested:
+                    system_message += "Include the user's signature at the end of the email since it was explicitly requested. "
+                else:
+                    system_message += "IMPORTANT: Do NOT include the user's signature, email address, or any closing with the user's name unless explicitly requested. End emails professionally but without any signature block. "
+            
+            system_message += "Be concise and only return the processed text without explanations unless specifically asked for commentary."
+            
+            # Construct the messages
+            messages = [
+                {
+                    "role": "system", 
+                    "content": system_message
+                }
+            ]
+            
+            # Add user context as a separate system message if available
+            if user_context:
+                messages.append({
+                    "role": "system",
+                    "content": user_context
+                })
+            
+            # Add the user message
+            if selected_text:
+                messages.append({
+                    "role": "user", 
+                    "content": f"User request: {prompt}\n\nSelected text: {selected_text}"
+                })
+            else:
+                messages.append({
+                    "role": "user", 
+                    "content": prompt
+                })
+            
+            # Make the API request
             response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={
@@ -1144,8 +1842,7 @@ class UnifiedAssistant:
             error_msg = f"Error during LLM processing: {str(e)}"
             print(error_msg)
             self.show_message(error_msg, message_type="error")
-            return None
-    
+        
     def insert_text(self, text):
         """Insert text at cursor position with enhanced handling for Notepad"""
         # First, check if the target window is Notepad
@@ -1299,7 +1996,7 @@ class UnifiedAssistant:
         
         finally:
             self.processing = False
-
+            
     def _process_text_to_speech(self, text):
         """Process text-to-speech request and play audio with improved ESC key handling"""
         try:
